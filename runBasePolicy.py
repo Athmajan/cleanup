@@ -1,24 +1,11 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Categorical
-import numpy as np
-import cv2
-import json
-
-
+from learnBasePolicy import REINFORCEController, create_movie_clip
 from cleanup import CleanupEnv
+import torch
+from reinforce import rgb_to_grayscale, visualize_image1
 import argparse
 import os
-import sys
-import shutil
-
+import torch.distributions as D
 import matplotlib.pyplot as plt
-from utility_funcs import make_video_from_rgb_imgs
-import io
-from PIL import Image
-import time
-from tqdm import tqdm
 
 #####################################
 parser = argparse.ArgumentParser(description='')
@@ -55,203 +42,92 @@ parser.add_argument(
 
 args = parser.parse_args()
 
-
 #######################################
 
 
 
-# Define constants and configurations
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+def load_policy(policy_path):
+    """
+    Load the saved policy from the given path.
+    """
+    policy = torch.load(policy_path, map_location=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
+    policy.eval()  # Set the policy to evaluation mode
+    return policy
 
-# Using a neural network to learn our policy parameters
-class PolicyNetwork(nn.Module):
-    def __init__(self, observation_space, action_space):
-        super(PolicyNetwork, self).__init__()
-        self.input_layer = nn.Linear(observation_space, 128)
-        self.output_layer = nn.Linear(128, action_space)
-    
-    def forward(self, x):
-        x = self.input_layer(x)
-        x = F.relu(x)
-        actions = self.output_layer(x)
-        action_probs = F.softmax(actions, dim=1)
-        return action_probs
-
-# Function to preprocess observations
-def preprocess_observations(obs, convert_to_gray=True):
-    obs = np.array(obs, dtype=np.uint8)
-    if len(obs.shape) != 3 or obs.shape[2] != 3:
-        raise ValueError("Expected observation with shape (H, W, 3), but got shape {}".format(obs.shape))
-    if convert_to_gray:
-        obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
-    obs = obs.flatten()
-    return obs / 255.0
+def plot_rewards(rewards):
+    """
+    Plot the cumulative rewards for each episode.
+    """
+    plt.figure(figsize=(10, 5))
+    plt.plot(rewards, label='Cumulative Rewards')
+    plt.xlabel('Episode')
+    plt.ylabel('Cumulative Reward')
+    plt.title('Cumulative Rewards per Episode')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
 
 
-def OHE_action(action):
-    if len(action) != 2 or not all(0 <= x <= 8 for x in action):
-        raise ValueError("Action must be a list of two elements, each between 1 and 9 (inclusive).")
-    
-    # Initialize the one-hot encoded vector with zeros
-    oheAction = np.zeros(18, dtype=int)
-    
-    # Set the corresponding positions to 1
-    oheAction[action[0] - 1] = 1
-    oheAction[9 + action[1] - 1] = 1
-    
-    return oheAction
 
-def set_action_positions(inputVector):
-    pos1 = inputVector[0]
-    pos2 = inputVector[1]
-    if not (0 <= pos1 < 18) or not (0 <= pos2 < 18):
-        raise ValueError("Positions must be in the range [0, 17]")
-
-    vector = [0] * 18  # Initialize the 18-long vector with zeros
-    vector[pos1] = 1   # Set the value at pos1 to 1
-    vector[pos2] = 1   # Set the value at pos2 to 1
-    
-    return vector
-    
-def decode_OHE_action(ohe_action):
-    '''Decodes a one-hot encoded action back into the original action elements.
-    
-    Args:
-    - ohe_action (Array): A one-hot encoded array of length 18
-    
-    Returns:
-    - (list): A list of two elements representing the original action
-    '''
-    if len(ohe_action) != 18 or not all(x in [0, 1] for x in ohe_action):
-        raise ValueError("One-hot encoded action must be an array of length 18 with binary values (0 or 1).")
-    
-    # Find the positions of the 1s in the one-hot encoded vector
-    pos1 = np.argmax(ohe_action[:9])
-    pos2 = np.argmax(ohe_action[9:])
-    
-    return [pos1, pos2]
-    
+class RuleBasedAgent():
+    def __init__(
+         self,
+         agent_id :int,
+         m_agents: int,
+         action_space_n : int,
 
 
-def create_actions_dict(action_list):
-    if len(action_list) != 2:
-        raise ValueError("Action list must contain exactly two elements.")
+    ):
+        self.id = agent_id,
+        self.m_agents = m_agents,
+        self.action_space_n = action_space_n,
 
-    actions_dict = {}
-    for i, action_value in enumerate(action_list):
-        agent_id = f"agent-{i}"
-        actions_dict[agent_id] = int(action_value)
-
-    return actions_dict
-
-
-# Function to select actions given current state
-def select_action(network, state):
-    ''' Selects two actions given current state
-    Args:
-    - network (Torch NN): network to process state
-    - state (Array): Array of action space in an environment
-    
-    Return:
-    - (tuple): two actions that are selected
-    - (tuple): log probabilities of selecting those actions given state and network
-    '''
-    
-    # Convert state to float tensor, add 1 dimension, allocate tensor on device
-    state = torch.from_numpy(state).float().unsqueeze(0).to(DEVICE)
-    
-    # Use network to predict action probabilities
-    action_probs = network(state)
-    state = state.detach()
-    
-    # Sample two actions using the probability distribution
-    m = Categorical(action_probs)
-    action1 = m.sample()
-    action2 = m.sample()
-    
-    # Return actions and their log probabilities
-    return (action1.item(), action2.item()), (m.log_prob(action1), m.log_prob(action2))
-
-# Function to load saved models
-def load_models(model_file):
-    checkpoint = torch.load(model_file, map_location=DEVICE)
-    policy_network = PolicyNetwork(450, 18).to(DEVICE)
-    policy_network.load_state_dict(checkpoint['policy_network_state_dict'])
-    policy_network.eval()  # Set to evaluation mode for inference
-    return policy_network
-
-def create_movie_clip(frames: list, output_file: str, fps: int = 10, scale_factor: int = 1):
-    # Assuming all frames have the same shape
-    height, width, layers = frames[0].shape
-    size = (width * scale_factor, height * scale_factor)
-    
-    out = cv2.VideoWriter(output_file, cv2.VideoWriter_fourcc(*'mp4v'), fps, size)
-    
-    for frame in frames:
-        # Upscale the frame
-        upscaled_frame = cv2.resize(frame, size, interpolation=cv2.INTER_NEAREST)
-        out.write(cv2.cvtColor(upscaled_frame, cv2.COLOR_RGB2BGR))
-    
-    out.release()
+    def act_with_info(
+        self,
+        probs # processed BW image,
+    ):
+        # probs = self.policy(obs) 
+        categorical_dist = D.Categorical(probs.view(-1, self.action_space_n[0]))  # Flatten the probabilities for sampling
+        actions = categorical_dist.sample().view(self.m_agents, -1).detach().cpu().numpy().flatten()
+        bestAction = actions[self.id]
+        return bestAction, actions
 
 
-def resize_and_text(img, scale_factor, titleText):
-    height, width, _ = img.shape
-    size = (int(width * scale_factor), int(height * scale_factor))
-    upscaled_frame = cv2.resize(img, size, interpolation=cv2.INTER_NEAREST)
 
-    # Create a blank image with space for the title above the frame
-    title_height = 50  # Adjust as needed
-    new_height = size[1] + title_height
-    combined_frame = np.zeros((new_height, size[0], 3), dtype=np.uint8)
-
-    # Place the upscaled frame in the lower part of the combined frame
-    combined_frame[title_height:new_height, 0:size[0]] = upscaled_frame
-
-    # Add white background for the title
-    cv2.rectangle(combined_frame, (0, 0), (size[0], title_height), (255, 255, 255), -1)
-
-    # Add titleText with black font
-    cv2.putText(combined_frame, titleText, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 1, cv2.LINE_AA)
-
-    return combined_frame
-
-LENGTH_EPISODE = 2000
-SCALEFACTOR = 20
 
 if __name__ == "__main__":
-    frames = []
-
-    # Example usage
-    model_file = "final_model.pth"  # Replace with your saved model file
-
-    # Load the trained policy network
-    policy_network = load_models(model_file)
-
-    # Example observation (replace with actual observation from your environment)
-
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    control = REINFORCEController()
+    policy = load_policy("REINFORCE.policy")
     env = CleanupEnv(num_agents=args.num_agents, render=True)
-    agents = list(env.agents.values())
-    obs = env.map_to_colors()
+    frames = []
+    cumulative_rewards = []
 
-    for i in tqdm(range(LENGTH_EPISODE)):
-        state = preprocess_observations(obs)
-        # Select action based on the observation
-        actions, log_probs = select_action(policy_network, state)
-        result_vector = set_action_positions(actions)
-        actionList = decode_OHE_action(result_vector)
-        action = create_actions_dict(actionList)
-        
-        rgb_arrNew = resize_and_text(obs,SCALEFACTOR,"Full Frame View")
-        frames.append(rgb_arrNew) 
+    EPISODES = 30
+    HORIZON = 600
+    for epi in range(EPISODES):
+        env.reset()
+        cumulativeReward = 0
+        for _ in range(HORIZON):
+            rgb_arr = env.render_preprocess()
+            rgb_arrScaled = control.resize_and_text(env.renderIMG(),20,"Full Frame")
+            BWImg = rgb_to_grayscale(rgb_arr)
+            BWImg = torch.tensor(BWImg, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+            probs = policy(BWImg) 
+            categorical_dist = D.Categorical(probs.view(-1, 8))  # Flatten the probabilities for sampling
+            actions = categorical_dist.sample().view(args.num_agents, -1).detach().cpu().numpy().flatten()
+            actiInput = {('agent-' + str(j)): actions[j] for j in range(0, args.num_agents)}
+            obs, rew, dones, info, = env.step(actiInput)
+            reward = 0
+            frames.append(rgb_arrScaled)
+            for agent in control.agents:
+                if rew[agent.agent_id] >0 :
+                    reward = reward + rew[agent.agent_id]
+            cumulativeReward = cumulativeReward + reward
 
-        try:
-            env.step(action)
-            obs = env.map_to_colors()
-        except:
-            pass
-
-    create_movie_clip(frames,"basePolicy_2_agents.mp4")
+        print(f"Cumulative reward of the episode {cumulativeReward}")
+        cumulative_rewards.append(cumulativeReward)
     
-        
-        
+    plot_rewards(cumulative_rewards)
+
+    create_movie_clip(frames,"RunningBasePolicy.mp4")

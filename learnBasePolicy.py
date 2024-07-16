@@ -1,201 +1,296 @@
-import numpy as np
-import cv2
-import json
-import glob
-import os
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
+import torch.distributions as D
+
+from reinforce import Policy
+from cleanup import CleanupOnlyAgent, CleanupEnv
 
 
-class Actor(nn.Module):
-    def __init__(self, action_size):
-        super(Actor, self).__init__()
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=8, stride=4)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-        self.fc1 = nn.Linear(64 * 7 * 7, 512)
-        self.fc2 = nn.Linear(512, action_size)
+import argparse
+import numpy as np
+import os
+import sys
+import shutil
 
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        x = F.softmax(self.fc2(x), dim=-1)
-        return x
+import matplotlib.pyplot as plt
+import cv2
+import io
+from PIL import Image
+import time
+from tqdm import tqdm
+import json
 
-class Critic(nn.Module):
+import torch.optim as optim
+
+
+
+#####################################
+parser = argparse.ArgumentParser(description='')
+
+parser.add_argument(
+    '--vid_path',
+    type=str,
+    default=os.path.abspath(os.path.join(os.path.dirname(__file__), './videos')),
+    help='Path to directory where videos are saved.')
+
+parser.add_argument(
+    '--env',
+    type=str,
+    default='cleanup',
+    help='Name of the environment to rollout.')
+
+parser.add_argument(
+    '--render_type',
+    type=str,
+    default='pretty',
+    help='Can be pretty or fast. Implications obvious.')
+
+parser.add_argument(
+    '--num_agents',
+    type=int,
+    default=2,
+    help='Number of agents.')
+
+parser.add_argument(
+    '--fps',
+    type=int,
+    default=8,
+    help='Number of frames per second.')
+
+args = parser.parse_args()
+
+
+#######################################
+
+
+
+
+
+class REINFORCEController():
     def __init__(self):
-        super(Critic, self).__init__()
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=8, stride=4)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-        self.fc1 = nn.Linear(64 * 7 * 7, 512)
-        self.fc2 = nn.Linear(512, 1)
+        self.env = CleanupEnv(num_agents=args.num_agents, render=True)
+        self.env.reset()
+        self.agents = list(self.env.agents.values())
+        self.actionDim= self.agents[0].action_space.n
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.policy = Policy().to(self.device)
+        
 
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
+    def resize_and_text(self,img, scale_factor, titleText):
+        height, width, _ = img.shape
+        size = (int(width * scale_factor), int(height * scale_factor))
+        upscaled_frame = cv2.resize(img, size, interpolation=cv2.INTER_NEAREST)
 
+        # Create a blank image with space for the title above the frame
+        title_height = 50  # Adjust as needed
+        new_height = size[1] + title_height
+        combined_frame = np.zeros((new_height, size[0], 3), dtype=np.uint8)
+
+        # Place the upscaled frame in the lower part of the combined frame
+        combined_frame[title_height:new_height, 0:size[0]] = upscaled_frame
+
+        # Add white background for the title
+        cv2.rectangle(combined_frame, (0, 0), (size[0], title_height), (255, 255, 255), -1)
+
+        # Add titleText with black font
+        cv2.putText(combined_frame, titleText, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 1, cv2.LINE_AA)
+
+        return combined_frame
+
+    def collect_trajectories(
+            self,
+            horizon,
+            ):
+        
+        # initialize returning lists and start the game!
+        state_list = []
+        reward_list = []
+        prob_list = []
+        action_list = []
+        obsList = []
+        obsList2 = []
+
+        randomAction = np.random.randint(self.actionDim,size=args.num_agents)
+
+        obs, rew, dones, info, = self.env.step(
+                        {('agent-' + str(j)): randomAction[j] for j in range(0, args.num_agents)})
+        
+        
+        cumulativeReward = 0
+        for t in range(horizon):
+            # Update observation
+            
+            rgb_arr = self.env.render_preprocess()
+            rgb_arrScaled = self.resize_and_text(self.env.renderIMG(),SCALEFACTOR,"Full Frame")
+            obsList.append(rgb_arrScaled)
+            obsList2.append(self.resize_and_text(rgb_arr,SCALEFACTOR,"Full Frame"))
+
+            BWImg = 0.2989 * rgb_arr[:, :, 0] + 0.5870 * rgb_arr[:, :, 1] + 0.1140 * rgb_arr[:, :, 2]
+
+            
+            BWImg = torch.tensor(BWImg, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(self.device)
+            state_list.append(BWImg)
+
+            probs = self.policy(BWImg)
+            probsArr = self.policy(BWImg).squeeze().cpu().detach().numpy()  # 2x8 matrix for 2 agents and 8 actions
+            
+            
+            prob_list.append(probsArr) # collection os 2x8 matrices
+            del probsArr
+            
+            categorical_dist = D.Categorical(probs.view(-1, 8))  # Flatten the probabilities for sampling
+            actions = categorical_dist.sample().view(args.num_agents, -1).detach().cpu().numpy().flatten()
+
+
+            # actions = torch.argmax(probs, dim=2).detach().numpy()
+            action_list.append(actions) # collection of 1x2 
+            actiInput = {('agent-' + str(j)): actions[j] for j in range(0, args.num_agents)}
+            obs, rew, dones, info, = self.env.step(actiInput)
+
+            reward = 0
+            for agent in self.agents:
+                if rew[agent.agent_id] >0 :
+                    reward = reward + rew[agent.agent_id]
+                    cumulativeReward = cumulativeReward + rew[agent.agent_id]
+            reward_list.append(reward)
+
+        return prob_list, state_list, action_list, reward_list, obsList, obsList2, cumulativeReward
     
 
 
-# def preprocess_observations(obs, convert_to_gray=True):
-#     # Ensure the input is a NumPy array
-#     obs = np.array(obs, dtype=np.uint8)
-
-#     # Check the shape of the observation to ensure it's (H, W, C)
-#     if len(obs.shape) != 3 or obs.shape[2] != 3:
-#         raise ValueError("Expected observation with shape (H, W, 3), but got shape {}".format(obs.shape))
-
-#     if convert_to_gray:
-#         # Convert to grayscale
-#         obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
-#         # Add an extra dimension to match the expected output shape
-#         obs = np.expand_dims(obs, axis=-1)
+def create_movie_clip(frames: list, output_file: str, fps: int = 10, scale_factor: int = 1):
+    # Assuming all frames have the same shape
+    height, width,layers = frames[0].shape
+    size = (width * scale_factor, height * scale_factor)
     
-#     return obs/255.0
+    out = cv2.VideoWriter(output_file, cv2.VideoWriter_fourcc(*'mp4v'), fps, size)
+    
+    for frame in frames:
+        # Upscale the frame
+        upscaled_frame = cv2.resize(frame, size, interpolation=cv2.INTER_NEAREST)
+        out.write(cv2.cvtColor(upscaled_frame, cv2.COLOR_RGB2BGR))
+    
+    out.release()
 
-def preprocess_observations(obs):
-    obs = np.array(obs, dtype=np.uint8)
-    obs = cv2.resize(obs, (8, 8))  # Resize image to 8x8
-    obs = obs / 255.0  # Normalize pixel values to range [0, 1]
-    obs = np.transpose(obs, (2, 0, 1))  # Transpose to (C, H, W) format
-    #obs = np.expand_dims(obs, axis=0)  # Add batch dimension
-    return obs
+
+# convert states to probability, passing through the policy
+def states_to_prob(policy, states):
+    states = torch.stack(states)
+    policy_input = states.view(-1,*states.shape[-3:])
+    policyOut = policy(policy_input)
+    return policyOut
 
 
+
+
+# return sum of log-prob divided by T
+# same thing as -policy_loss
+def surrogate(policy, old_probs, states, actions, rewards,device,
+              discount = 0.995, beta=0.01):
+    
+    rewardsTensor = torch.tensor(rewards, dtype=torch.float, device=device).view(LENGTH_EPISODE, 1, 1)
+
+    discount = discount**np.arange(len(rewards))
+
+    rewards = np.asarray(rewards)*discount[:,np.newaxis]
+
+    
+    # convert rewards to future rewards
+    rewards_future = rewards[::-1].cumsum(axis=0)[::-1]
+    
+    mean = np.mean(rewards_future, axis=1)
+    std = np.std(rewards_future, axis=1) + 1.0e-10
+
+    rewards_normalized = (rewards_future - mean[:,np.newaxis])/std[:,np.newaxis]
+    
+    # convert everything into pytorch tensors and move to gpu if available
+    actions = torch.tensor(actions, dtype=torch.int64, device=device) # torch.Size([200, 2])
+    old_probs = torch.tensor(old_probs, dtype=torch.float, device=device)
+    rewards = torch.tensor(rewards_normalized, dtype=torch.float, device=device)
+
+
+    
+    
+
+    # convert states to policy (or probability)
+    new_probs = states_to_prob(policy, states)
+
+
+
+    entropyOld = -torch.sum(old_probs * torch.log(old_probs + 1e-10), dim=2)
+    entropyNew = -torch.sum(new_probs * torch.log(new_probs + 1e-10), dim=2)
+    
+    entropy  = (entropyOld + entropyNew)/2
+    att1 = beta*entropy
+    att1Copy = att1.view(LENGTH_EPISODE, 2, 1)
+    ratio = new_probs/old_probs
+    att2 = ratio * rewardsTensor
+    outputtt = torch.mean(att1Copy + att2)
+    return outputtt
+
+
+
+SCALEFACTOR = 20
+LENGTH_EPISODE = 500
+NUM_EPISODE = 2000
+totalFrames = []
+totalFrames2 = []
+beta = 0.01
+discountRate = 0.99
+mean_rewards = []
+
+# widget bar to display progress
+import progressbar as pb
+widget = ['training loop: ', pb.Percentage(), ' ', 
+          pb.Bar(), ' ', pb.ETA() ]
+timer = pb.ProgressBar(widgets=widget, maxval=NUM_EPISODE).start()
 
 
 if __name__ == "__main__":
-    if os.path.exists('observations.npy') and os.path.exists('actions.npy') and \
-    os.path.exists('rewards.npy') and os.path.exists('next_observations.npy'):
-        # Load from .npy files
-        observations = np.load('observations.npy')
-        actions = np.load('actions.npy', allow_pickle=True)  # Load actions with allow_pickle=True
-        rewards = np.load('rewards.npy')
-        next_observations = np.load('next_observations.npy')
-
-    else:
-        observations = []
-        actions = []
-        rewards = []
-        next_observations = []
-
-        file_pattern = "Episode_*_Rewards_Observations.json"
-        files = glob.glob(file_pattern)
-        filtered_files = [f for f in files if any(f"Episode_{i}_Rewards_Observations.json" in f for i in range(5))]
-
-        for file in filtered_files:
-            print(file)
-            with open(file, 'r') as f:
-                EpisodeData = json.load(f)
-        
-            for i, frame in enumerate(EpisodeData):
-                obs = frame["Observation"]
-                rew = 0  # Initialize reward to zero
-                if frame["Reward"]["agent-0"] > 0 and frame["Reward"]["agent-1"] > 0:
-                    rew = frame["Reward"]["agent-0"] + frame["Reward"]["agent-1"]
-
-                action = frame["Action"]  # Assuming actions are also stored
-
-                processed_obs = preprocess_observations(obs)
-
-                observations.append(processed_obs)
-                actions.append(action)
-                rewards.append(rew)
-
-            if i < len(EpisodeData) - 1:
-                next_obs = EpisodeData[i + 1]["Observation"]
-                processed_next_obs = preprocess_observations(next_obs)
-                next_observations.append(processed_next_obs)
-            else:
-                next_observations.append(np.zeros_like(processed_obs))  # Terminal state
-
-        observations = np.array(observations)
-        actions = np.array(actions)
-        rewards = np.array(rewards)
-        next_observations = np.array(next_observations)
-
-        np.save('observations.npy', observations)
-        np.save('actions.npy', actions)
-        np.save('rewards.npy', rewards)
-        np.save('next_observations.npy', next_observations)
-
-    # Convert to PyTorch tensors
-    observations = torch.tensor(observations, dtype=torch.float32).unsqueeze(1)
-    actions = torch.tensor(actions, dtype=torch.int64)
-    rewards = torch.tensor(rewards, dtype=torch.float32)
-    next_observations = torch.tensor(next_observations, dtype=torch.float32).unsqueeze(1)
-
-    # Define Actor and Critic networks
-    action_size = len(np.unique(actions))  # Number of unique actions
-    actor = Actor(action_size)
-    critic = Critic()
-
-    # Define optimizers
-    actor_optimizer = optim.Adam(actor.parameters(), lr=0.0001)
-    critic_optimizer = optim.Adam(critic.parameters(), lr=0.0001)
-
-    def compute_advantage(rewards, values, next_values, dones, gamma=0.99):
-        deltas = rewards + gamma * next_values * (1 - dones) - values
-        advantage = deltas.clone()
-        return advantage
-
-    def train_actor_critic(observations, actions, rewards, next_observations, actor, critic, actor_optimizer, critic_optimizer, gamma=0.99):
-        actor_optimizer.zero_grad()
-        critic_optimizer.zero_grad()
-
-        # Compute critic predictions
-        values = critic(observations)
-        next_values = critic(next_observations)
-
-        # Compute advantage
-        target_values = rewards + gamma * next_values
-        advantage = target_values - values
-
-        # Actor loss
-        log_probs = torch.log(actor(observations))
-        selected_log_probs = advantage.detach() * log_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
-        actor_loss = -selected_log_probs.mean()
-
-        # Critic loss
-        critic_loss = F.mse_loss(values, target_values.detach())
-
-        # Backpropagation
-        actor_loss.backward()
-        critic_loss.backward()
-        actor_optimizer.step()
-        critic_optimizer.step()
-
-        return actor_loss.item(), critic_loss.item()
+    control = REINFORCEController()
+    policy = Policy().to(torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
+    optimizer = optim.Adam(policy.parameters(), lr=1e-4)
     
+    for epi in range(NUM_EPISODE):
+        prob_list, state_list, action_list, reward_list, obsList, obsList2, cumulativeReward = control.collect_trajectories(horizon=LENGTH_EPISODE) # TODO Fix True condition
+        Lsur = -surrogate(Policy().to(torch.device("cuda:0" if torch.cuda.is_available() else "cpu")), 
+                  prob_list, 
+                  state_list, 
+                  action_list, 
+                  reward_list,
+                  torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+                  )
+        
+        totalRewards = np.sum(reward_list,axis=0)
+        
 
-    # Training loop
-    epochs = 1000
-    batch_size = 32
-    for epoch in range(epochs):
-        permutation = np.random.permutation(len(observations))
-        for i in range(0, len(observations), batch_size):
-            indices = np.random.randint(0, 5, batch_size)
-            batch_observations = observations[indices]
-            batch_actions = actions[indices]
-            batch_rewards = rewards[indices]
-            batch_next_observations = next_observations[indices]
 
-            actor_loss, critic_loss = train_actor_critic(
-                batch_observations, batch_actions, batch_rewards,
-                batch_next_observations,
-                actor, critic, actor_optimizer, critic_optimizer
-            )
+        optimizer.zero_grad()
+        Lsur.backward()
+        optimizer.step()
+        del Lsur
 
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch}, Actor Loss: {actor_loss}, Critic Loss: {critic_loss}")
+        beta*=0.995
+        mean_rewards.append(np.mean(totalRewards))
+
+
+
+        # display some progress every 20 iterations
+        if (epi+1)%20 ==0 :
+            print("Episode: {0:d}, score: {1:f}".format(epi+1,np.mean(totalRewards)))
+
+
+            torch.save(policy, 'REINFORCE.policy')
+
+        timer.update(epi+1)
+
+    timer.finish()
+        
+        # newProbs = states_to_prob(Policy().to(torch.device("cuda:0" if torch.cuda.is_available() else "cpu")), state_list)
+        # print(action_list)
+        # totalFrames = totalFrames + obsList
+        # totalFrames2 = totalFrames2 + obsList2
+        # print(cumulativeReward)
+    # create_movie_clip(totalFrames,"REINFORCE_2_agents_Colour.mp4")
+    # create_movie_clip(totalFrames2,"REINFORCE_2_agents_BW.mp4")

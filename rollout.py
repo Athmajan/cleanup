@@ -127,8 +127,6 @@ def combine_frames(full_frame, agent_views, num_agents, padding=10, title_height
 
         combined_frame[y_offset:y_offset + agent_height, x_offset:x_offset + agent_width, :] = agent_view
 
-       
-
     return combined_frame
 
 def combine_rewards(img1, img2):
@@ -196,7 +194,6 @@ def save_rgb_image(image_rgb, save_path):
 
 
 NUM_EPISODE = 50
-
 LENGTH_EPISODE = 2000
 SCALEFACTOR = 20
 
@@ -234,6 +231,7 @@ if __name__ == "__main__":
 
             # Avoid Firing action for now
             rand_action = np.random.randint(agents[0].action_space.n, size=args.num_agents)
+
 
             obs, rew, dones, info, = env.step(
                         {('agent-' + str(j)): rand_action[j] for j in range(0, args.num_agents)})

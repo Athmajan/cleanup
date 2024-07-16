@@ -70,6 +70,23 @@ def create_movie_clip(frames: list, output_file: str, fps: int = 10, scale_facto
     out.release()
 
 
+
+def plot_rewards(rewards):
+    """
+    Plot the cumulative rewards for each episode.
+    """
+    plt.figure(figsize=(10, 5))
+    plt.plot(rewards, label='Cumulative Rewards')
+    plt.xlabel('Episode')
+    plt.ylabel('Cumulative Reward')
+    plt.title('Cumulative Rewards per Episode')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+ 
+
 class randomController():
     def __init__(self):
         self.env = CleanupEnv(num_agents=args.num_agents, render=True)
@@ -173,7 +190,8 @@ class randomController():
             self,
             horizon,
             savePath,
-            multiView
+            multiView,
+            preprocess,
     ):
         cumulativeReward = 0
         rewardHistory = []
@@ -183,7 +201,10 @@ class randomController():
             randomAction = np.random.randint(self.actionDim,size=args.num_agents)
             obs, rew, dones, info, = self.env.step(
                         {('agent-' + str(j)): randomAction[j] for j in range(0, args.num_agents)})
-            rgb_arr = self.env.map_to_colors()
+            if preprocess:
+                rgb_arr = self.env.render_preprocess()
+            else:
+                rgb_arr = self.env.map_to_colors()
             rgb_arr = self.resize_and_text(rgb_arr,SCALEFACTOR,"Full Frame")
             frames.append(rgb_arr)
             for agent in self.agents:
@@ -228,15 +249,20 @@ class randomController():
         
 
 SCALEFACTOR = 20
-LENGTH_EPISODE = 500
-NUM_EPISODE = 10
+LENGTH_EPISODE = 600
+NUM_EPISODE = 30
 totalFrames = []
-
+PREPROCESS = False
 if __name__ == "__main__":
     control = randomController()
+    cumulative_rewards = []
     for epi in range(NUM_EPISODE):
 
-        frames, cumulativeReward = control.rollout(horizon=LENGTH_EPISODE,savePath=args.vid_path,multiView=False) # TODO Fix True condition
+        frames, cumulativeReward = control.rollout(horizon=LENGTH_EPISODE,savePath=args.vid_path,multiView=False,preprocess=PREPROCESS) # TODO Fix True condition
         totalFrames = totalFrames + frames
         print("Episode Reward = ", cumulativeReward)
+        cumulative_rewards.append(cumulativeReward)
+
+    plot_rewards(cumulative_rewards)
     create_movie_clip(totalFrames,"randomRollout_2_agents.mp4")
+

@@ -47,6 +47,32 @@ DEFAULT_COLOURS = {' ': [0, 0, 0],  # Black background
                    '8': [250, 204, 255],  # Pink
                    '9': [238, 223, 16]}  # Yellow
 
+
+PREPROCESS_COLOURS = {' ': [255, 255, 255],  # Black background
+                   '0': [255, 255, 255],  # Black background beyond map walls
+                   '': [255, 255, 255],  # Grey board walls
+                   '@': [0, 0, 0],  # Grey board walls
+                   'A': [0, 0, 0],  # Green apples
+                   'F': [255, 255, 255],  # Yellow fining beam
+                   'P': [0, 0, 0],  # Purple player
+
+                   # Colours for agents. R value is a unique identifier
+                   '1': [0, 0, 0],  # Purple
+                   '2': [0, 0, 0],  # Blue
+                   '3': [0, 0, 0],  # Magenta
+                   '4': [0, 0, 0],  # Red
+                   '5': [0, 0, 0],  # Orange
+                   '6': [0, 0, 0],  # Cyan
+                   '7': [0, 0, 0],  # Lavender
+                   '8': [0, 0, 0],  # Pink
+                   '9': [0, 0, 0],
+                   'R': [0,0,0], # River
+                   'H': [255,255,255],  # Dirt
+                   'S': [0,0,0],  # Stream
+                   'C': [255,255,255],}  # No idea
+
+
+
 # the axes look like
 # graphic is here to help me get my head in order
 # WARNING: increasing array position in the direction of down
@@ -126,6 +152,28 @@ class MapEnv(MultiAgentEnv):
     def custom_map_update(self):
         """Custom map updates that don't have to do with agent actions"""
         pass
+
+    def reset_from_observation(self,grid):
+        """
+        Reset from a custom observation
+        Grid = env.get_map_with_agents()
+        """
+        self.beam_pos = []
+        self.agents = {}
+        self.setup_agents()
+        self.reset_map()
+        self.custom_map_update()
+
+        map_with_agents = grid
+
+        observations = {}
+        for agent in self.agents.values():
+            agent.grid = map_with_agents
+            # agent.grid = util.return_view(map_with_agents, agent.pos,
+            #                               agent.row_size, agent.col_size)
+            rgb_arr = self.map_to_colors(agent.get_state(), self.color_map)
+            observations[agent.agent_id] = rgb_arr
+        return observations
 
     def setup_agents(self):
         """Construct all the agents for the environment"""
@@ -340,6 +388,50 @@ class MapEnv(MultiAgentEnv):
             plt.show()
         else:
             plt.savefig(filename)
+
+    def renderIMG(self, filename=None):
+        """ Creates an image of the map to plot or save.
+
+        Args:
+            path: If a string is passed, will save the image
+                to disk at this location.
+        """
+        map_with_agents = self.get_map_with_agents()
+
+        rgb_arr = self.map_to_colors(map_with_agents)
+        return rgb_arr
+    
+
+
+
+
+
+    def render_preprocess(self, filename=None):
+        """ Creates an image of the map to plot or save.
+
+        Args:
+            path: If a string is passed, will save the image
+                to disk at this location.
+        """
+        map_with_agents = self.get_map_with_agents()
+        rgb_arr = self.map_to_colors(map_with_agents, color_map=PREPROCESS_COLOURS)
+
+        # Create a new row of black pixels
+        black_row = np.zeros((1, rgb_arr.shape[1], rgb_arr.shape[2]), dtype=rgb_arr.dtype)
+
+        # Append the black row to the bottom of the image
+        rgb_arr = np.vstack([black_row,rgb_arr ])
+
+        # Uncomment these lines if you want to display or save the image
+        # plt.imshow(rgb_arr, interpolation='nearest')
+        # if filename is None:
+        #     plt.show()
+        # else:
+        #     plt.savefig(filename)
+        
+        return rgb_arr
+    
+
 
     def renderIMG(self, filename=None):
         """ Creates an image of the map to plot or save.
