@@ -97,10 +97,31 @@ class REINFORCEController():
         cv2.putText(combined_frame, titleText, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 1, cv2.LINE_AA)
 
         return combined_frame
+    
 
+    def makeBWTensor(
+            self,
+            rgbImage
+    ):
+        BWImg = 0.2989 * rgbImage[:, :, 0] + 0.5870 * rgbImage[:, :, 1] + 0.1140 * rgbImage[:, :, 2]
+        BWImage = torch.tensor(BWImg, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(self.device)
+        return BWImage
+
+
+
+    def getActionDict(
+            self,
+            probs,
+                      ):
+        
+        categorical_dist = D.Categorical(probs.view(-1, 8))  # Flatten the probabilities for sampling
+        actions = categorical_dist.sample().view(args.num_agents, -1).detach().cpu().numpy().flatten()
+        actiInput = {('agent-' + str(j)): actions[j] for j in range(0, args.num_agents)}
+        return actions, actiInput
+    
     def collect_trajectories(
             self,
-            horizon,
+            terminateReward,
             ):
         
         # initialize returning lists and start the game!
@@ -108,44 +129,27 @@ class REINFORCEController():
         reward_list = []
         prob_list = []
         action_list = []
-        obsList = []
-        obsList2 = []
 
+        
+
+
+        # Take one step
         randomAction = np.random.randint(self.actionDim,size=args.num_agents)
-
         obs, rew, dones, info, = self.env.step(
                         {('agent-' + str(j)): randomAction[j] for j in range(0, args.num_agents)})
         
         
         cumulativeReward = 0
-        for t in range(horizon):
+        while cumulativeReward<=terminateReward:
+       
             # Update observation
-            
             rgb_arr = self.env.render_preprocess()
-            rgb_arrScaled = self.resize_and_text(self.env.renderIMG(),SCALEFACTOR,"Full Frame")
-            obsList.append(rgb_arrScaled)
-            obsList2.append(self.resize_and_text(rgb_arr,SCALEFACTOR,"Full Frame"))
-
-            BWImg = 0.2989 * rgb_arr[:, :, 0] + 0.5870 * rgb_arr[:, :, 1] + 0.1140 * rgb_arr[:, :, 2]
-
+            BWImg  = self.makeBWTensor(rgb_arr)
             
-            BWImg = torch.tensor(BWImg, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(self.device)
-            state_list.append(BWImg)
-
             probs = self.policy(BWImg)
-            probsArr = self.policy(BWImg).squeeze().cpu().detach().numpy()  # 2x8 matrix for 2 agents and 8 actions
-            
-            
-            prob_list.append(probsArr) # collection os 2x8 matrices
-            del probsArr
-            
-            categorical_dist = D.Categorical(probs.view(-1, 8))  # Flatten the probabilities for sampling
-            actions = categorical_dist.sample().view(args.num_agents, -1).detach().cpu().numpy().flatten()
 
-
-            # actions = torch.argmax(probs, dim=2).detach().numpy()
-            action_list.append(actions) # collection of 1x2 
-            actiInput = {('agent-' + str(j)): actions[j] for j in range(0, args.num_agents)}
+            actions, actiInput = self.getActionDict(probs)
+            
             obs, rew, dones, info, = self.env.step(actiInput)
 
             reward = 0
@@ -153,13 +157,17 @@ class REINFORCEController():
                 if rew[agent.agent_id] >0 :
                     reward = reward + rew[agent.agent_id]
                     cumulativeReward = cumulativeReward + rew[agent.agent_id]
+
+            state_list.append(BWImg)
+            action_list.append(actions) # collection of 1x2 
+            prob_list.append(probs.squeeze().cpu().detach().numpy()) # collection os 2x8 matrices
             reward_list.append(reward)
 
-        return prob_list, state_list, action_list, reward_list, obsList, obsList2, cumulativeReward
+        return prob_list, state_list, action_list, reward_list
     
 
 
-def create_movie_clip(frames: list, output_file: str, fps: int = 10, scale_factor: int = 1):
+def create_movie_clip(frames: list, output_file: str, fps: int = 30, scale_factor: int = 1):
     # Assuming all frames have the same shape
     height, width,layers = frames[0].shape
     size = (width * scale_factor, height * scale_factor)
@@ -188,8 +196,8 @@ def states_to_prob(policy, states):
 # same thing as -policy_loss
 def surrogate(policy, old_probs, states, actions, rewards,device,
               discount = 0.995, beta=0.01):
-    
-    rewardsTensor = torch.tensor(rewards, dtype=torch.float, device=device).view(LENGTH_EPISODE, 1, 1)
+    sizeofEpisode = len(states)
+    rewardsTensor = torch.tensor(rewards, dtype=torch.float, device=device).view(sizeofEpisode, 1, 1)
 
     discount = discount**np.arange(len(rewards))
 
@@ -205,8 +213,8 @@ def surrogate(policy, old_probs, states, actions, rewards,device,
     rewards_normalized = (rewards_future - mean[:,np.newaxis])/std[:,np.newaxis]
     
     # convert everything into pytorch tensors and move to gpu if available
-    actions = torch.tensor(actions, dtype=torch.int64, device=device) # torch.Size([200, 2])
-    old_probs = torch.tensor(old_probs, dtype=torch.float, device=device)
+    actions = torch.tensor(np.array(actions), dtype=torch.int64, device=device) # torch.Size([200, 2])
+    old_probs = torch.tensor(np.array(old_probs), dtype=torch.float, device=device)
     rewards = torch.tensor(rewards_normalized, dtype=torch.float, device=device)
 
 
@@ -223,7 +231,7 @@ def surrogate(policy, old_probs, states, actions, rewards,device,
     
     entropy  = (entropyOld + entropyNew)/2
     att1 = beta*entropy
-    att1Copy = att1.view(LENGTH_EPISODE, 2, 1)
+    att1Copy = att1.view(sizeofEpisode, 2, 1)
     ratio = new_probs/old_probs
     att2 = ratio * rewardsTensor
     outputtt = torch.mean(att1Copy + att2)
@@ -232,28 +240,23 @@ def surrogate(policy, old_probs, states, actions, rewards,device,
 
 
 SCALEFACTOR = 20
-LENGTH_EPISODE = 500
-NUM_EPISODE = 2000
-totalFrames = []
-totalFrames2 = []
+TERMINATION_REWARD = 10
+NUM_EPISODE = 9000
 beta = 0.01
 discountRate = 0.99
 mean_rewards = []
 
-# widget bar to display progress
-import progressbar as pb
-widget = ['training loop: ', pb.Percentage(), ' ', 
-          pb.Bar(), ' ', pb.ETA() ]
-timer = pb.ProgressBar(widgets=widget, maxval=NUM_EPISODE).start()
 
 
 if __name__ == "__main__":
     control = REINFORCEController()
     policy = Policy().to(torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
     optimizer = optim.Adam(policy.parameters(), lr=1e-4)
-    
+    pbar = tqdm(total=NUM_EPISODE, desc='Episodes')
+
     for epi in range(NUM_EPISODE):
-        prob_list, state_list, action_list, reward_list, obsList, obsList2, cumulativeReward = control.collect_trajectories(horizon=LENGTH_EPISODE) # TODO Fix True condition
+        prob_list, state_list, action_list, reward_list= control.collect_trajectories(terminateReward=TERMINATION_REWARD) # TODO Fix True condition
+        
         Lsur = -surrogate(Policy().to(torch.device("cuda:0" if torch.cuda.is_available() else "cpu")), 
                   prob_list, 
                   state_list, 
@@ -261,7 +264,6 @@ if __name__ == "__main__":
                   reward_list,
                   torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
                   )
-        
         totalRewards = np.sum(reward_list,axis=0)
         
 
@@ -274,23 +276,11 @@ if __name__ == "__main__":
         beta*=0.995
         mean_rewards.append(np.mean(totalRewards))
 
-
-
+        pbar.update(1)
         # display some progress every 20 iterations
         if (epi+1)%20 ==0 :
-            print("Episode: {0:d}, score: {1:f}".format(epi+1,np.mean(totalRewards)))
-
-
             torch.save(policy, 'REINFORCE.policy')
 
-        timer.update(epi+1)
+    pbar.close()
 
-    timer.finish()
         
-        # newProbs = states_to_prob(Policy().to(torch.device("cuda:0" if torch.cuda.is_available() else "cpu")), state_list)
-        # print(action_list)
-        # totalFrames = totalFrames + obsList
-        # totalFrames2 = totalFrames2 + obsList2
-        # print(cumulativeReward)
-    # create_movie_clip(totalFrames,"REINFORCE_2_agents_Colour.mp4")
-    # create_movie_clip(totalFrames2,"REINFORCE_2_agents_BW.mp4")

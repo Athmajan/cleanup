@@ -13,7 +13,7 @@ from PIL import Image
 import time
 from tqdm import tqdm
 import json
-
+import pandas as pd
 
 
 
@@ -55,7 +55,7 @@ args = parser.parse_args()
 
 #######################################
 
-def create_movie_clip(frames: list, output_file: str, fps: int = 10, scale_factor: int = 1):
+def create_movie_clip(frames: list, output_file: str, fps: int = 30, scale_factor: int = 1):
     # Assuming all frames have the same shape
     height, width, layers = frames[0].shape
     size = (width * scale_factor, height * scale_factor)
@@ -73,13 +73,13 @@ def create_movie_clip(frames: list, output_file: str, fps: int = 10, scale_facto
 
 def plot_rewards(rewards):
     """
-    Plot the cumulative rewards for each episode.
+    Plot the time steps taken for each episode.
     """
     plt.figure(figsize=(10, 5))
-    plt.plot(rewards, label='Cumulative Rewards')
+    plt.plot(rewards, label='Time Steps per Episode')
     plt.xlabel('Episode')
-    plt.ylabel('Cumulative Reward')
-    plt.title('Cumulative Rewards per Episode')
+    plt.ylabel('TIme Steps')
+    plt.title('Time Steps per Episode')
     plt.legend()
     plt.grid(True)
     plt.show()
@@ -188,7 +188,7 @@ class randomController():
 
     def rollout(
             self,
-            horizon,
+            TERMINATION_REWARD,
             savePath,
             multiView,
             preprocess,
@@ -196,11 +196,13 @@ class randomController():
         cumulativeReward = 0
         rewardHistory = []
         frames = []
-
-        for i in tqdm(range(horizon), desc='Episodes'):
+        stepsCount = 0
+        
+        while cumulativeReward<=TERMINATION_REWARD:
             randomAction = np.random.randint(self.actionDim,size=args.num_agents)
             obs, rew, dones, info, = self.env.step(
                         {('agent-' + str(j)): randomAction[j] for j in range(0, args.num_agents)})
+            stepsCount += 1
             if preprocess:
                 rgb_arr = self.env.render_preprocess()
             else:
@@ -210,6 +212,7 @@ class randomController():
             for agent in self.agents:
                 if rew[agent.agent_id] >0 :
                     cumulativeReward = cumulativeReward + rew[agent.agent_id]
+                    
 
 
             # TODO need to fix issues in this True condition
@@ -241,7 +244,9 @@ class randomController():
 
                 frames.append(newcombinedFrame)
 
-        return frames, cumulativeReward
+                
+        
+        return frames, stepsCount
 
 
                 
@@ -249,20 +254,30 @@ class randomController():
         
 
 SCALEFACTOR = 20
-LENGTH_EPISODE = 600
-NUM_EPISODE = 30
-totalFrames = []
+TERMINATION_REWARD = 10
+NUM_EPISODE = 300
 PREPROCESS = False
+EXPERIMENTCOUNT = 30
 if __name__ == "__main__":
-    control = randomController()
-    cumulative_rewards = []
-    for epi in range(NUM_EPISODE):
+    dfTimeHistoryMaster = pd.DataFrame()
+    pbar = tqdm(total=EXPERIMENTCOUNT*NUM_EPISODE, desc='Episodes')
+    for experiment in range(EXPERIMENTCOUNT):
+        timeStepsHistory = []
+        control = randomController()
+        frames = []
+        for epi in range(NUM_EPISODE):
+            control.env.reset()
+            frames, stepsCount = control.rollout(TERMINATION_REWARD=TERMINATION_REWARD,savePath=args.vid_path,multiView=False,preprocess=PREPROCESS) # TODO Fix True condition
+            timeStepsHistory.append({"Episode":epi,"TimeTaken":stepsCount})
+            pbar.update(1)
+            if (epi + 1) % 100 ==0:
+                create_movie_clip(frames,f"finite_results/FINITE_randomRoll_2_agents_{experiment}_{epi}.mp4")
 
-        frames, cumulativeReward = control.rollout(horizon=LENGTH_EPISODE,savePath=args.vid_path,multiView=False,preprocess=PREPROCESS) # TODO Fix True condition
-        totalFrames = totalFrames + frames
-        print("Episode Reward = ", cumulativeReward)
-        cumulative_rewards.append(cumulativeReward)
+        dfTimeHistory = pd.DataFrame(timeStepsHistory)
+        dfTimeHistory["Experiment"] = experiment
+        dfTimeHistoryMaster = pd.concat([dfTimeHistoryMaster, dfTimeHistory], ignore_index=True)
+    
+    pbar.close()
+    dfTimeHistoryMaster.to_csv("finite_results/time_history_master.csv", index=False)
 
-    plot_rewards(cumulative_rewards)
-    create_movie_clip(totalFrames,"randomRollout_2_agents.mp4")
 

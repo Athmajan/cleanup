@@ -6,7 +6,8 @@ import argparse
 import os
 import torch.distributions as D
 import matplotlib.pyplot as plt
-
+import pandas as pd
+from tqdm import tqdm
 #####################################
 parser = argparse.ArgumentParser(description='')
 
@@ -81,6 +82,11 @@ class RuleBasedAgent():
         self.id = agent_id,
         self.m_agents = m_agents,
         self.action_space_n = action_space_n,
+    
+    def act(self):
+        print("calling act in rule based")
+
+        return "OK"
 
     def act_with_info(
         self,
@@ -100,34 +106,51 @@ if __name__ == "__main__":
     control = REINFORCEController()
     policy = load_policy("REINFORCE.policy")
     env = CleanupEnv(num_agents=args.num_agents, render=True)
-    frames = []
-    cumulative_rewards = []
-
-    EPISODES = 30
-    HORIZON = 600
-    for epi in range(EPISODES):
-        env.reset()
-        cumulativeReward = 0
-        for _ in range(HORIZON):
-            rgb_arr = env.render_preprocess()
-            rgb_arrScaled = control.resize_and_text(env.renderIMG(),20,"Full Frame")
-            BWImg = rgb_to_grayscale(rgb_arr)
-            BWImg = torch.tensor(BWImg, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
-            probs = policy(BWImg) 
-            categorical_dist = D.Categorical(probs.view(-1, 8))  # Flatten the probabilities for sampling
-            actions = categorical_dist.sample().view(args.num_agents, -1).detach().cpu().numpy().flatten()
-            actiInput = {('agent-' + str(j)): actions[j] for j in range(0, args.num_agents)}
-            obs, rew, dones, info, = env.step(actiInput)
-            reward = 0
-            frames.append(rgb_arrScaled)
-            for agent in control.agents:
-                if rew[agent.agent_id] >0 :
-                    reward = reward + rew[agent.agent_id]
-            cumulativeReward = cumulativeReward + reward
-
-        print(f"Cumulative reward of the episode {cumulativeReward}")
-        cumulative_rewards.append(cumulativeReward)
     
-    plot_rewards(cumulative_rewards)
+    dfTimeHistoryMaster = pd.DataFrame()
+    EPISODES = 300
+    TERMINATION_REWARD = 10
+    EXPERIMENTCOUNT = 30
+    pbar = tqdm(total=EPISODES*EXPERIMENTCOUNT, desc='Episodes')
+    for experiment in range(EXPERIMENTCOUNT):
+        timeStepsHistory = []
+        
+        for epi in range(EPISODES):
+            frames = []
+            env.reset()
+            cumulativeReward = 0
+            stepsCount = 0
+            
+            while cumulativeReward<=TERMINATION_REWARD:
+                rgb_arr = env.render_preprocess()
+                rgb_arrScaled = control.resize_and_text(env.renderIMG(),20,"Full Frame")
+                BWImg = rgb_to_grayscale(rgb_arr)
+                BWImg = torch.tensor(BWImg, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+                probs = policy(BWImg) 
+                categorical_dist = D.Categorical(probs.view(-1, 8))  # Flatten the probabilities for sampling
+                actions = categorical_dist.sample().view(args.num_agents, -1).detach().cpu().numpy().flatten()
+                actiInput = {('agent-' + str(j)): actions[j] for j in range(0, args.num_agents)}
+                obs, rew, dones, info, = env.step(actiInput)
+                stepsCount += 1
 
-    create_movie_clip(frames,"RunningBasePolicy.mp4")
+                reward = 0
+                frames.append(rgb_arrScaled)
+                for agent in control.agents:
+                    if rew[agent.agent_id] >0 :
+                        reward = reward + rew[agent.agent_id]
+                cumulativeReward = cumulativeReward + reward
+            timeStepsHistory.append({"Episode":epi,"TimeTaken":stepsCount})
+            pbar.update(1)
+            # if (epi + 1) % 100 ==0:
+            #     create_movie_clip(frames,f"finite_results/FINITE_BasePolicy_{experiment}_{epi}.mp4")
+            
+    
+        dfTimeHistory = pd.DataFrame(timeStepsHistory)
+        dfTimeHistory["Experiment"] = experiment
+        dfTimeHistoryMaster = pd.concat([dfTimeHistoryMaster, dfTimeHistory], ignore_index=True)
+
+    pbar.close()
+    # dfTimeHistoryMaster.to_csv("finite_results/BasePolicyResults.csv", index=False)
+             
+
+    
